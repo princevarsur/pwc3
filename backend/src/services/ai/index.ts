@@ -2,6 +2,7 @@ import { AIProvider, FeedbackContext, FeedbackResult } from './types';
 import { ScriptedProvider } from './scripted';
 import { ClaudeProvider } from './claude';
 import { OllamaProvider } from './ollama';
+import { OpenAIProvider } from './openai';
 import { logger } from '../logger';
 import { getAISettings } from '../ai-config';
 
@@ -24,6 +25,8 @@ async function resolveProvider(): Promise<AIProvider | null> {
     return new ClaudeProvider();
   } else if (cfg.activeProvider === 'ollama') {
     return new OllamaProvider();
+  } else if (cfg.activeProvider === 'openai' && cfg.openai.apiKey && cfg.openai.baseUrl) {
+    return new OpenAIProvider();
   }
   return null;
 }
