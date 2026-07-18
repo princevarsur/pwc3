@@ -579,6 +579,109 @@ async function injectWithClaude(
   return validateInject(parsed, injectIndex, phase);
 }
 
+// ─── OpenAI-compatible: shared request helper ─────────────────────────────────
+
+async function openaiChatRequest(
+  baseUrl: string,
+  model: string,
+  apiKey: string,
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens: number,
+  temperature: number,
+  timeoutMs: number,
+): Promise<string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: maxTokens,
+      temperature,
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '');
+    throw new Error(`OpenAI HTTP ${response.status}${errBody ? ': ' + errBody.slice(0, 200) : ''}`);
+  }
+
+  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const rawText = data.choices?.[0]?.message?.content?.trim() ?? '';
+  if (!rawText) throw new Error('OpenAI returned empty response');
+  return rawText;
+}
+
+// ─── OpenAI-compatible: setup ──────────────────────────────────────────────────
+
+async function setupWithOpenAI(
+  type: AiScenarioType,
+  difficulty: AiDifficulty,
+  rounds: number,
+  orgContext?: OrgContext,
+): Promise<ScenarioSetup> {
+  const cfg = await getAISettings();
+  const { baseUrl, model, apiKey, temperature, maxTokens } = cfg.openai;
+  const prompt = await buildSetupPrompt(type, difficulty, rounds, orgContext);
+  const systemPrompt = await getTemplateContent('scripted_inject_system');
+
+  logger.info('Generating scenario setup via OpenAI-compatible provider', { type, difficulty, rounds, model });
+
+  // Use the configured (≥4000-floored) token budget rather than Claude's tighter
+  // 768 — reasoning models exposed through OpenAI-compatible endpoints (e.g.
+  // Gemini) spend hidden "thinking" tokens out of the same max_tokens budget,
+  // so a small budget can be exhausted before any visible JSON is emitted.
+  const rawText = await openaiChatRequest(baseUrl, model, apiKey, systemPrompt, prompt, maxTokens, temperature, SETUP_TIMEOUT_MS);
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(extractJSON(rawText));
+  } catch {
+    throw new Error('AI returned malformed setup JSON — please try again.');
+  }
+
+  return validateSetup(parsed, rounds);
+}
+
+// ─── OpenAI-compatible: inject ─────────────────────────────────────────────────
+
+async function injectWithOpenAI(
+  type: AiScenarioType,
+  difficulty: AiDifficulty,
+  rounds: number,
+  injectIndex: number,
+  phase: string,
+  setup: { title: string; description: string },
+  previousInjects: InjectContext[],
+  orgContext?: OrgContext,
+): Promise<GeneratedInject> {
+  const cfg = await getAISettings();
+  const { baseUrl, model, apiKey, temperature, maxTokens } = cfg.openai;
+  const prompt = await buildInjectPrompt(type, difficulty, rounds, injectIndex, phase, setup, previousInjects, orgContext);
+  const systemPrompt = await getTemplateContent('scripted_inject_system');
+
+  logger.info('Generating inject via OpenAI-compatible provider', { type, difficulty, injectIndex, phase, model });
+
+  const rawText = await openaiChatRequest(baseUrl, model, apiKey, systemPrompt, prompt, maxTokens, temperature, INJECT_TIMEOUT_MS);
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(extractJSON(rawText));
+  } catch {
+    throw new Error(`AI returned malformed JSON for inject ${injectIndex + 1} — please try again.`);
+  }
+
+  return validateInject(parsed, injectIndex, phase);
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function generateScenarioSetup(
@@ -587,9 +690,10 @@ export async function generateScenarioSetup(
   rounds: number,
   orgContext?: OrgContext,
 ): Promise<ScenarioSetup> {
-  const { activeProvider, anthropic } = await getAISettings();
+  const { activeProvider, anthropic, openai } = await getAISettings();
   if (activeProvider === 'anthropic' && anthropic.apiKey) return setupWithClaude(type, difficulty, rounds, orgContext);
   if (activeProvider === 'ollama') return setupWithOllama(type, difficulty, rounds, orgContext);
+  if (activeProvider === 'openai' && openai.apiKey && openai.baseUrl) return setupWithOpenAI(type, difficulty, rounds, orgContext);
   throw new Error('AI scenario generation requires an active AI provider configured in the Admin → AI Config panel.');
 }
 
@@ -600,10 +704,15 @@ export async function streamScenarioSetup(
   orgContext: OrgContext | undefined,
   onToken: (token: string) => void,
 ): Promise<ScenarioSetup> {
-  const { activeProvider, anthropic } = await getAISettings();
+  const { activeProvider, anthropic, openai } = await getAISettings();
   if (activeProvider === 'ollama') return streamSetupWithOllama(type, difficulty, rounds, orgContext, onToken);
   if (activeProvider === 'anthropic' && anthropic.apiKey) {
     const setup = await setupWithClaude(type, difficulty, rounds, orgContext);
+    for (const word of (setup.title + '\n' + setup.description).split(/(?<=\s)/)) onToken(word);
+    return setup;
+  }
+  if (activeProvider === 'openai' && openai.apiKey && openai.baseUrl) {
+    const setup = await setupWithOpenAI(type, difficulty, rounds, orgContext);
     for (const word of (setup.title + '\n' + setup.description).split(/(?<=\s)/)) onToken(word);
     return setup;
   }
@@ -621,7 +730,7 @@ export async function streamSingleInject(
   onToken: (token: string) => void,
   orgContext?: OrgContext,
 ): Promise<GeneratedInject> {
-  const { activeProvider, anthropic } = await getAISettings();
+  const { activeProvider, anthropic, openai } = await getAISettings();
   if (activeProvider === 'ollama') {
     const inject = await injectWithOllama(type, difficulty, rounds, injectIndex, phase, setup, previousInjects, orgContext);
     for (const word of inject.narrative.split(/(?<=\s)/)) onToken(word);
@@ -629,6 +738,11 @@ export async function streamSingleInject(
   }
   if (activeProvider === 'anthropic' && anthropic.apiKey) {
     const inject = await injectWithClaude(type, difficulty, rounds, injectIndex, phase, setup, previousInjects, orgContext);
+    for (const word of inject.narrative.split(/(?<=\s)/)) onToken(word);
+    return inject;
+  }
+  if (activeProvider === 'openai' && openai.apiKey && openai.baseUrl) {
+    const inject = await injectWithOpenAI(type, difficulty, rounds, injectIndex, phase, setup, previousInjects, orgContext);
     for (const word of inject.narrative.split(/(?<=\s)/)) onToken(word);
     return inject;
   }
@@ -645,10 +759,12 @@ export async function generateSingleInject(
   previousInjects: InjectContext[],
   orgContext?: OrgContext,
 ): Promise<GeneratedInject> {
-  const { activeProvider, anthropic } = await getAISettings();
+  const { activeProvider, anthropic, openai } = await getAISettings();
   if (activeProvider === 'anthropic' && anthropic.apiKey)
     return injectWithClaude(type, difficulty, rounds, injectIndex, phase, setup, previousInjects, orgContext);
   if (activeProvider === 'ollama')
     return injectWithOllama(type, difficulty, rounds, injectIndex, phase, setup, previousInjects, orgContext);
+  if (activeProvider === 'openai' && openai.apiKey && openai.baseUrl)
+    return injectWithOpenAI(type, difficulty, rounds, injectIndex, phase, setup, previousInjects, orgContext);
   throw new Error('AI scenario generation requires an active AI provider configured in the Admin → AI Config panel.');
 }
