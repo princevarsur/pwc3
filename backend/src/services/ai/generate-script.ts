@@ -123,6 +123,30 @@ async function callAI(prompt: string): Promise<string> {
     return data.response?.trim() ?? '';
   }
 
+  if (cfg.activeProvider === 'openai' && cfg.openai.apiKey && cfg.openai.baseUrl) {
+    const { baseUrl, model, apiKey, temperature, maxTokens } = cfg.openai;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const res = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: maxTokens,
+        temperature,
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`OpenAI HTTP ${res.status}${body ? ': ' + body.slice(0, 200) : ''}`);
+    }
+    const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
+    return data.choices?.[0]?.message?.content?.trim() ?? '';
+  }
+
   throw new Error('No AI provider configured.');
 }
 

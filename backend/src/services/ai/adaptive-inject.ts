@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { jsonrepair } from 'jsonrepair';
 import { logger } from '../logger';
 import { getTemplateContent, applyTemplate } from '../prompt-templates';
-import { getAISettings } from '../ai-config';
+import { getAISettings, OpenAIConfig } from '../ai-config';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -126,6 +126,39 @@ async function generateWithOllama(systemPrompt: string, userPrompt: string): Pro
     preview: data.response?.slice(-300), // last 300 chars to see if truncated
   });
   return data.response.trim();
+}
+
+/** Call an OpenAI-compatible chat completions endpoint and return the raw response text. */
+async function generateWithOpenAI(cfg: OpenAIConfig, systemPrompt: string, userPrompt: string): Promise<string> {
+  const { baseUrl, model, apiKey, maxTokens, temperature } = cfg;
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: maxTokens,
+      temperature,
+    }),
+    signal: AbortSignal.timeout(120000),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`OpenAI request failed: ${response.status} ${response.statusText} — ${body.slice(0, 200)}`);
+  }
+
+  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const text = data.choices?.[0]?.message?.content?.trim() ?? '';
+  if (!text) throw new Error('OpenAI returned empty response');
+  return text;
 }
 
 function maturityLabel(level: number): string {
@@ -520,8 +553,20 @@ export async function generateAdaptiveInject(ctx: AdaptiveInjectContext): Promis
       logger.error('Failed to parse generated inject', { error: String(parseErr), raw: raw.slice(0, 500) });
       throw new Error(`AI response could not be parsed as inject JSON: ${String(parseErr)}`);
     }
+  } else if (aiCfg.activeProvider === 'openai' && aiCfg.openai.apiKey && aiCfg.openai.baseUrl) {
+    // ── OpenAI-compatible path (single call, same shape as the Claude path) ──
+    const injectSystemPrompt = await getTemplateContent('adaptive_inject_system');
+    const raw = await generateWithOpenAI(aiCfg.openai, injectSystemPrompt, buildInjectPrompt(ctx));
+    try {
+      const inject = parseGeneratedInject(raw);
+      logger.info('Adaptive inject generated', { title: inject.title, phase: inject.phase });
+      return inject;
+    } catch (parseErr) {
+      logger.error('Failed to parse generated inject', { error: String(parseErr), raw: raw.slice(0, 500) });
+      throw new Error(`AI response could not be parsed as inject JSON: ${String(parseErr)}`);
+    }
   } else {
-    throw new Error('No AI provider configured. Set AI_PROVIDER=ollama or ANTHROPIC_API_KEY.');
+    throw new Error('No AI provider configured. Set AI_PROVIDER=ollama, ANTHROPIC_API_KEY, or configure an OpenAI-compatible provider in the Admin → AI Config panel.');
   }
 }
 
@@ -590,6 +635,8 @@ export async function generateAIDebrief(ctx: AIDebriefContext): Promise<string> 
         messages: [{ role: 'user', content: buildDebriefPrompt(ctx) }],
       });
       text = message.content[0].type === 'text' ? message.content[0].text : '';
+    } else if (debriefCfg.activeProvider === 'openai' && debriefCfg.openai.apiKey && debriefCfg.openai.baseUrl) {
+      text = await generateWithOpenAI(debriefCfg.openai, debriefSystemPrompt, buildDebriefPrompt(ctx));
     } else {
       logger.warn('No AI provider configured — skipping AI debrief generation');
       return '';
