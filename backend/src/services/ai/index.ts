@@ -2,26 +2,33 @@ import { AIProvider, FeedbackContext, FeedbackResult } from './types';
 import { ScriptedProvider } from './scripted';
 import { ClaudeProvider } from './claude';
 import { OllamaProvider } from './ollama';
+import { OpenAIProvider } from './openai';
 import { logger } from '../logger';
+import { getAISettings } from '../ai-config';
 
 export { FeedbackContext, FeedbackResult };
 
-// Provider chain with automatic fallback
-// Configured provider → scripted fallback
-let primaryProvider: AIProvider | null = null;
+// Provider is resolved fresh on every call via getAISettings() (the same
+// DB-backed source of truth used by scenario/inject/debrief generation),
+// instead of once at process boot, so admin-panel provider changes take
+// effect immediately without a container restart.
 
+/** @deprecated No longer needed — provider resolution now happens per-request in resolveProvider(). Kept as a no-op so existing callers don't break. */
 export function initAIProvider(): void {
-  const configured = process.env.AI_PROVIDER || 'scripted';
+  // no-op
+}
 
-  if (configured === 'claude' && process.env.ANTHROPIC_API_KEY) {
-    primaryProvider = new ClaudeProvider();
-    logger.info('AI provider: Claude');
-  } else if (configured === 'ollama') {
-    primaryProvider = new OllamaProvider();
-    logger.info('AI provider: Ollama', { model: process.env.OLLAMA_MODEL });
-  } else {
-    logger.info('AI provider: Scripted (default)');
+async function resolveProvider(): Promise<AIProvider | null> {
+  const cfg = await getAISettings();
+
+  if (cfg.activeProvider === 'anthropic' && cfg.anthropic.apiKey) {
+    return new ClaudeProvider();
+  } else if (cfg.activeProvider === 'ollama') {
+    return new OllamaProvider();
+  } else if (cfg.activeProvider === 'openai' && cfg.openai.apiKey && cfg.openai.baseUrl) {
+    return new OpenAIProvider();
   }
+  return null;
 }
 
 export async function generateFeedback(
@@ -29,6 +36,7 @@ export async function generateFeedback(
   scriptedFeedback: string
 ): Promise<FeedbackResult> {
   const scripted = new ScriptedProvider(scriptedFeedback);
+  const primaryProvider = await resolveProvider();
 
   if (!primaryProvider) {
     return scripted.generateFeedback(ctx);
@@ -46,6 +54,3 @@ export async function generateFeedback(
     return scripted.generateFeedback(ctx);
   }
 }
-
-// Initialize on import
-initAIProvider();
